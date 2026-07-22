@@ -1,0 +1,46 @@
+name: contract_review
+description: Extract key contract terms, get approval, and notify the requester.
+attachments:
+  count: 2
+states:
+  extract_terms:
+    type: llm_extraction
+    call: pointee.ai.tool
+    timeout:
+      startToClose: 60s
+    input:
+      document: $.data.attachments.attachment0
+      instructions: $.data.instructions
+    transitions:
+      - to: review_terms
+      - to: notify_failure
+        on: failure
+
+  review_terms:
+    type: approval
+    call: pointee.approval.request
+    input:
+      summary: $.data.extract_terms.summary
+      reference: $.data.attachments.attachment1
+    on_approve: send_confirmation
+    on_reject: notify_failure
+
+  send_confirmation:
+    type: action
+    call: pointee.email.call
+    input:
+      to: $.data.requester.email
+      body: $.data.extract_terms.summary
+    transitions:
+      - to: end
+
+  notify_failure:
+    type: action
+    call: pointee.form.request
+    input:
+      message: $.data.error_message
+    transitions:
+      - to: end
+
+  end:
+    type: terminal
