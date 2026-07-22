@@ -1,0 +1,690 @@
+name: Nabidky
+version: 1
+initial: ParseRequest
+states:
+  ParseRequest:
+    title: Parse Request
+    onEntry:
+      kind: sequence
+      actions:
+      - as: resolveDivision
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ emailFrom }) {
+              var from = String(emailFrom || '').toLowerCase();
+              // mapovani domeny/adresy schranky -> divize + cenikova sada
+              // (rozsirte podle skutecnych 6 divizi a jejich ceniku)
+              var division = 'fortinet';
+              var cenikTable = 'cenik';
+              return { division: division, cenikTable: cenikTable };
+            }
+          inputs: '{ emailFrom: $.data.emailFrom }'
+        outputs:
+          type: object
+          properties:
+            division:
+              type: string
+            cenikTable:
+              type: string
+      - as: prepParseInput
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ body }) {
+              var schema = '[{ "qty": 0, "model": "", "term": "", "service": "" }]';
+              var msg = 'Vrat POUZE JSON pole radku poptavky v presne teto strukture:\n'
+                      + schema + '\n\nText e-mailu:\n' + (body || '');
+              return { inputMessage: msg };
+            }
+          inputs: '{ body: $.data.emailBody }'
+      - as: parseLlm
+        kind: builtin
+        name: pointee.ai.call
+        args:
+          instructions: '"Jsi parser poptavek na sitove produkty (Fortinet).\n\nZ textu e-mailu vytahni VSECHNY radky poptavky. Vrat STRIKTNE jedno JSON pole, zadny markdown, zadny komentar.\n\nKazdy radek ma:\n- qty     : mnozstvi (cislo). Vzory: \"2x\", \"2 ks\", \"2 pcs\" -> 2. Kdyz neni uvedeno, vrat 1.\n- model   : zakladni model, napr. \"FG-30G\", \"FG-80F\". Bez sluzeb a doby.\n- term    : doba jako \"1y\", \"3y\", \"5y\". Vzory: \"1yUTP\", \"1 rok\", \"1 year\" -> \"1y\". Kdyz neni, prazdny retezec.\n- service : sluzba/bundle jako zkratka: \"UTP\" (Unified Threat Protection), \"ENT\" (Enterprise Protection), \"ATP\" (Advanced Threat Protection). Vzor \"1yUTP\" -> service \"UTP\". Kdyz neni, prazdny retezec.\n\nNic si nevymyslej. Kdyz si polem nejsi jisty, nech prazdne."'
+          inputMessage: $.actions.prepParseInput.output.inputMessage
+          providerId: '"019c8ac5-3272-79c1-81f5-53cb1f89de7e"'
+        outputs:
+          type: object
+          properties:
+            text:
+              type: string
+      - as: parseResult
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ rawText }) {
+              var text = String(rawText || '')
+                .replace(/^```json\s*/i, '')
+                .replace(/^```\s*/i, '')
+                .replace(/\s*```$/i, '')
+                .trim();
+              var parsed = null;
+              var ok = false;
+              try { parsed = JSON.parse(text); ok = true; } catch (e) {}
+              var items = [];
+              if (ok && parsed && parsed.length) {
+                for (var i = 0; i < parsed.length; i++) {
+                  var it = parsed[i] || {};
+                  items.push({
+                    qty:     (typeof it.qty === 'number') ? it.qty : (parseInt(it.qty, 10) || 1),
+                    model:   String(it.model || '').toUpperCase().trim(),
+                    term:    String(it.term || '').toLowerCase().trim(),
+                    service: String(it.service || '').toUpperCase().trim()
+                  });
+                }
+              }
+              return { requestItems: items, parseOk: ok && items.length > 0 };
+            }
+          inputs: '{ rawText: $.actions.parseLlm.output.text }'
+        outputs:
+          type: object
+          properties:
+            requestItems:
+              type: array
+            parseOk:
+              type: boolean
+      - kind: mutate
+        set:
+          division: $.actions.resolveDivision.output.division
+          cenikTable: $.actions.resolveDivision.output.cenikTable
+          requestItems: $.actions.parseResult.output.requestItems
+      - as: setParseFail
+        kind: branch
+        when: $.actions.parseResult.output.parseOk == false
+        do:
+          kind: mutate
+          set:
+            failReason: '"parse_failed"'
+    transitions:
+    - to: Failed
+      title: E-mail nelze rozparsovat
+      when: $.actions.parseResult.output.parseOk == false
+    - to: MatchSKU
+      when: $.actions.parseResult.output.parseOk
+  MatchSKU:
+    title: Match SKU
+    onEntry:
+      kind: sequence
+      actions:
+      - as: readCenik
+        kind: builtin
+        name: pointee.dataset.read
+        args:
+          datasetId: '"REPLACE_DATASET_ID_CENIK"'
+          tableNames: '["cenik"]'
+        outputs:
+          type: object
+          properties:
+            cenik:
+              type: array
+      - as: match
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ items, cenikRows, division, threshold }) {
+              var rows = cenikRows || [];
+              var th = (typeof threshold === 'number') ? threshold : 0.8;
+
+              // doba -> suffix SKU bundlu
+              var termSuffix = { '1y': '-12', '3y': '-36', '5y': '-60' };
+              // sluzba -> klicove slovo v popisu (spolehlivejsi nez cislo bundlu)
+              var serviceKeyword = {
+                'UTP': 'unified threat protection',
+                'ENT': 'enterprise protection',
+                'ATP': 'advanced threat protection'
+              };
+
+              function endsWithStr(s, suf) {
+                s = String(s); suf = String(suf);
+                return s.length >= suf.length && s.indexOf(suf, s.length - suf.length) !== -1;
+              }
+
+              var out = [];
+              var anyLow = false;
+
+              (items || []).forEach(function (it, idx) {
+                var model   = String(it.model || '').toUpperCase().trim();
+                var term    = String(it.term || '').toLowerCase().trim();
+                var service = String(it.service || '').toUpperCase().trim();
+                var qty     = (typeof it.qty === 'number') ? it.qty : (parseInt(it.qty, 10) || 1);
+
+                // kandidati: stejna divize + SKU zacina na model
+                var cand = rows.filter(function (r) {
+                  var okDiv = !division || !r.division || String(r.division) === String(division);
+                  return okDiv && String(r.sku || '').toUpperCase().indexOf(model) === 0;
+                });
+
+                // filtr podle sluzby (klicove slovo v popisu)
+                if (service && serviceKeyword[service]) {
+                  var kw = serviceKeyword[service];
+                  cand = cand.filter(function (r) {
+                    return String(r.description || '').toLowerCase().indexOf(kw) !== -1;
+                  });
+                }
+
+                // filtr podle doby (suffix SKU)
+                if (term && termSuffix[term]) {
+                  var suf = termSuffix[term];
+                  cand = cand.filter(function (r) { return endsWithStr(String(r.sku || ''), suf); });
+                }
+
+                // kdyz uzivatel nechtel zadnou sluzbu ani dobu -> hola HW polozka
+                if (!service && !term) {
+                  cand = cand.filter(function (r) {
+                    return String(r.sku || '').toUpperCase() === model;
+                  });
+                }
+
+                var chosen = null, confidence = 0, reason = '';
+                if (cand.length === 1) {
+                  chosen = cand[0]; confidence = 1;
+                } else if (cand.length === 0) {
+                  confidence = 0; reason = 'no_match';
+                } else {
+                  chosen = cand[0]; confidence = 0.5;
+                  reason = 'multiple_candidates:' + cand.length;
+                }
+                if (confidence < th) anyLow = true;
+
+                var cands = [];
+                for (var c = 0; c < cand.length; c++) { cands.push(cand[c].sku); }
+
+                out.push({
+                  lineNo: idx + 1,
+                  qty: qty,
+                  requested: (it.model || '') + ' ' + (it.term || '') + ' ' + (it.service || ''),
+                  sku: chosen ? chosen.sku : null,
+                  description: chosen ? chosen.description : null,
+                  cenikPrice: chosen ? chosen.price : null,
+                  currency: chosen ? (chosen.currency || 'USD') : null,
+                  confidence: confidence,
+                  reason: reason,
+                  candidates: cands
+                });
+              });
+
+              return { matchedItems: out, hasLowConfidence: anyLow === true };
+            }
+          inputs: '{ items: $.data.requestItems, cenikRows: $.actions.readCenik.output.cenik, division: $.data.division, threshold: 0.8 }'
+        outputs:
+          type: object
+          properties:
+            matchedItems:
+              type: array
+            hasLowConfidence:
+              type: boolean
+      - kind: mutate
+        set:
+          matchedItems: $.actions.match.output.matchedItems
+          hasLowConfidence: $.actions.match.output.hasLowConfidence
+    transitions:
+    - to: HumanMatch
+      title: Nizka shoda -> rucni doplneni
+      when: $.actions.match.output.hasLowConfidence
+    - to: Pricing
+      when: $.actions.match.output.hasLowConfidence == false
+  HumanMatch:
+    title: Human Match
+    onEntry:
+      kind: sequence
+      actions:
+      - as: prepMatchReview
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ matchedItems }) {
+              var items = matchedItems || [];
+              var lines = ['PAROVANI SKU - radky k overeni:', ''];
+              items.forEach(function (it) {
+                if (it.confidence >= 0.8) return;
+                lines.push('Radek ' + it.lineNo + ': poptavka "' + it.requested + '"');
+                lines.push('  Navrzene SKU: ' + (it.sku || '(nenalezeno)'));
+                if (it.candidates && it.candidates.length > 1) {
+                  lines.push('  Kandidati: ' + it.candidates.join(', '));
+                }
+                lines.push('  Duvod: ' + (it.reason || 'low_confidence'));
+                lines.push('');
+              });
+              lines.push('Doplnte prosim spravne SKU u oznacenych radku.');
+              return { prehled: lines.join('\n') };
+            }
+          inputs: '{ matchedItems: $.data.matchedItems }'
+      - kind: mutate
+        set:
+          prehled: $.actions.prepMatchReview.output.prehled
+      - as: matchForm
+        kind: builtin
+        name: pointee.form.request
+        args:
+          formId: '"REPLACE_FORM_ID_MATCH_REVIEW"'
+          assigneeType: '"caseCreator"'
+          description: '"Doplnte/opravte SKU u nejednoznacnych radku poptavky."'
+          caseId: $.case.id
+        title: ' Rucni doplneni SKU'
+      - as: applyMatch
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ matchedItems, cenikRows, corrections }) {
+              // corrections = { "1": "FG-30G-BDL-950-12", ... } z formulare (lineNo -> SKU)
+              var items = matchedItems || [];
+              var rows = cenikRows || [];
+              var corr = corrections || {};
+
+              function findRow(sku) {
+                for (var i = 0; i < rows.length; i++) {
+                  if (String(rows[i].sku) === String(sku)) return rows[i];
+                }
+                return null;
+              }
+
+              items.forEach(function (it) {
+                var key = String(it.lineNo);
+                if (corr[key]) {
+                  var r = findRow(corr[key]);
+                  it.sku = corr[key];
+                  it.description = r ? r.description : it.description;
+                  it.cenikPrice = r ? r.price : it.cenikPrice;
+                  it.currency = r ? (r.currency || 'USD') : it.currency;
+                  it.confidence = 1;
+                  it.reason = 'human_corrected';
+                }
+              });
+              return { matchedItems: items };
+            }
+          inputs: '{ matchedItems: $.data.matchedItems, cenikRows: $.actions.readCenik.output.cenik, corrections: $.data.skuCorrections }'
+        outputs:
+          type: object
+          properties:
+            matchedItems:
+              type: array
+      - kind: mutate
+        set:
+          matchedItems: $.actions.applyMatch.output.matchedItems
+    transitions:
+    - to: Pricing
+      when: $.actions.applyMatch.completed
+  Pricing:
+    title: Pricing
+    onEntry:
+      kind: sequence
+      actions:
+      - as: readDiscounts
+        kind: builtin
+        name: pointee.dataset.read
+        args:
+          datasetId: '"REPLACE_DATASET_ID_NABIDKY"'
+          tableNames: '["slevy"]'
+        outputs:
+          type: object
+          properties:
+            slevy:
+              type: array
+      - as: price
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ matchedItems, discountRows, partnerEmail, division }) {
+              var items = matchedItems || [];
+              var rows = discountRows || [];
+
+              // najdi sazbu slevy pro partnera/divizi (0..1). Kdyz neni, rate=null.
+              var rate = null;
+              var dom = String(partnerEmail || '').split('@')[1] || '';
+              for (var i = 0; i < rows.length; i++) {
+                var r = rows[i];
+                var okDiv = !division || !r.division || String(r.division) === String(division);
+                var okPartner = (r.domain && dom && String(r.domain).toLowerCase() === dom.toLowerCase())
+                             || (r.partner_email && String(r.partner_email).toLowerCase() === String(partnerEmail).toLowerCase());
+                if (okDiv && okPartner && typeof r.rate === 'number') { rate = r.rate; break; }
+              }
+
+              function round2(n) { return Math.round(n * 100) / 100; }
+
+              var out = [];
+              items.forEach(function (it) {
+                var listUnit = (typeof it.cenikPrice === 'number') ? it.cenikPrice : null;
+                var listTotal = (listUnit !== null) ? round2(listUnit * it.qty) : null;
+                var partnerUnit = (listUnit !== null && rate !== null) ? round2(listUnit * (1 - rate)) : null;
+                var partnerTotal = (partnerUnit !== null) ? round2(partnerUnit * it.qty) : null;
+
+                var copy = {};
+                for (var k in it) { if (it.hasOwnProperty(k)) copy[k] = it[k]; }
+                copy.listUnit = listUnit;
+                copy.listTotal = listTotal;
+                copy.discountRate = rate;
+                copy.partnerUnit = partnerUnit;
+                copy.partnerTotal = partnerTotal;
+                out.push(copy);
+              });
+
+              return { pricedItems: out, discountRate: rate, canPrice: rate !== null };
+            }
+          inputs: '{ matchedItems: $.data.matchedItems, discountRows: $.actions.readDiscounts.output.slevy, partnerEmail: $.data.emailFrom, division: $.data.division }'
+        outputs:
+          type: object
+          properties:
+            pricedItems:
+              type: array
+            discountRate:
+              type: number
+            canPrice:
+              type: boolean
+      - as: readNabidky
+        kind: builtin
+        name: pointee.dataset.read
+        args:
+          datasetId: '"REPLACE_DATASET_ID_NABIDKY"'
+          tableNames: '["nabidky"]'
+        outputs:
+          type: object
+          properties:
+            nabidky:
+              type: array
+      - as: genNumber
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ nabidky, division }) {
+              var rows = nabidky || [];
+              var max = 261410; // vychozi rada; nahradte navazanim na CRM sekvenci
+              for (var i = 0; i < rows.length; i++) {
+                var seq = parseInt(String(rows[i].seq || 0), 10);
+                if (!isNaN(seq) && seq > max) max = seq;
+              }
+              var next = max + 1;
+              var inic = 'PB'; // TODO: odvodit z prihlaseneho inside sales / divize
+              return { seq: next, cisloNabidky: next + '-v1-' + inic };
+            }
+          inputs: '{ nabidky: $.actions.readNabidky.output.nabidky, division: $.data.division }'
+        outputs:
+          type: object
+          properties:
+            seq:
+              type: number
+            cisloNabidky:
+              type: string
+      - kind: mutate
+        set:
+          pricedItems: $.actions.price.output.pricedItems
+          discountRate: $.actions.price.output.discountRate
+          canPrice: $.actions.price.output.canPrice
+          nabidkaSeq: $.actions.genNumber.output.seq
+          cisloNabidky: $.actions.genNumber.output.cisloNabidky
+    transitions:
+    - to: BuildNabidka
+      when: $.actions.genNumber.completed
+  BuildNabidka:
+    title: Build Nabidka
+    onEntry:
+      kind: sequence
+      actions:
+      - as: buildPayload
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ pricedItems, cisloNabidky, partnerEmail, division }) {
+              var items = pricedItems || [];
+              var payload = {
+                cislo_nabidky: cisloNabidky || null,
+                partner: partnerEmail || null,
+                division: division || null,
+                platnost_dni: 30,
+                polozky: items.map(function (it) {
+                  return {
+                    pocet: it.qty,
+                    kod_produktu: it.sku,
+                    popis: it.description,
+                    cenikova_cena_ks: it.listUnit,
+                    cenikova_cena_celkem: it.listTotal,
+                    mena: it.currency,
+                    sleva: it.discountRate,
+                    partner_cena_ks: it.partnerUnit,
+                    partner_cena_celkem: it.partnerTotal
+                  };
+                })
+              };
+              return { nabidkaPayload: payload };
+            }
+          inputs: '{ pricedItems: $.data.pricedItems, cisloNabidky: $.data.cisloNabidky, partnerEmail: $.data.emailFrom, division: $.data.division }'
+        outputs:
+          type: object
+          properties:
+            nabidkaPayload:
+              type: object
+      - as: renderXlsx
+        kind: builtin
+        name: pointee.api.tool
+        args:
+          inputs: '{ data: $.actions.buildPayload.output.nabidkaPayload }'
+          url: '"https://test-pointee-di-weu.cognitiveservices.azure.com/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31"'
+          method: '"POST"'
+          sourceId: '"019f2ef2-7a8b-7047-a13e-5df8f23b6d3d"'
+        outputs:
+          type: object
+          properties:
+            fileRef:
+              type: string
+      - kind: mutate
+        set:
+          nabidkaPayload: $.actions.buildPayload.output.nabidkaPayload
+          nabidkaFileRef: $.actions.renderXlsx.output.fileRef
+    transitions:
+    - to: Approval
+      when: $.actions.renderXlsx.completed
+  Approval:
+    title: Approval
+    onEntry:
+      kind: sequence
+      actions:
+      - as: prepApproval
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ pricedItems, cisloNabidky, canPrice }) {
+              var items = pricedItems || [];
+              var lines = ['Nabidka ' + (cisloNabidky || '') , ''];
+              lines.push('# | pocet | SKU | cenik/ks | sleva | partner/celkem');
+              items.forEach(function (it) {
+                lines.push(it.lineNo + ' | ' + it.qty + ' | ' + (it.sku || '?')
+                  + ' | ' + (it.listUnit !== null ? it.listUnit : '?')
+                  + ' | ' + (it.discountRate !== null ? it.discountRate : 'CHYBI')
+                  + ' | ' + (it.partnerTotal !== null ? it.partnerTotal : 'CHYBI'));
+              });
+              lines.push('');
+              if (!canPrice) {
+                lines.push('POZOR: sleva partnera nebyla nalezena - doplnte ji ve formulari.');
+              }
+              lines.push('Zkontrolujte SKLAD a nabidku schvalte, nebo upravte.');
+              return { prehled: lines.join('\n') };
+            }
+          inputs: '{ pricedItems: $.data.pricedItems, cisloNabidky: $.data.cisloNabidky, canPrice: $.data.canPrice }'
+      - kind: mutate
+        set:
+          prehled: $.actions.prepApproval.output.prehled
+      - as: approvalForm
+        kind: builtin
+        name: pointee.form.request
+        args:
+          formId: '"REPLACE_FORM_ID_APPROVAL"'
+          assigneeType: '"caseCreator"'
+          description: '"Zkontrolujte nabidku a sklad, pripadne doplnte slevu, a schvalte."'
+          caseId: $.case.id
+        title: ' Schvaleni nabidky'
+      - as: applyApproval
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ pricedItems, approved, overrideDiscount }) {
+              var items = pricedItems || [];
+              function round2(n) { return Math.round(n * 100) / 100; }
+
+              // kdyz clovek doplnil slevu ve formulari, prepocitej
+              var rate = (typeof overrideDiscount === 'number') ? overrideDiscount : null;
+              if (rate !== null) {
+                items.forEach(function (it) {
+                  if (typeof it.listUnit === 'number') {
+                    it.discountRate = rate;
+                    it.partnerUnit = round2(it.listUnit * (1 - rate));
+                    it.partnerTotal = round2(it.partnerUnit * it.qty);
+                  }
+                });
+              }
+              return { pricedItems: items, approved: approved === true };
+            }
+          inputs: '{ pricedItems: $.data.pricedItems, approved: $.data.approved, overrideDiscount: $.data.overrideDiscount }'
+        outputs:
+          type: object
+          properties:
+            pricedItems:
+              type: array
+            approved:
+              type: boolean
+      - kind: mutate
+        set:
+          pricedItems: $.actions.applyApproval.output.pricedItems
+          approved: $.actions.applyApproval.output.approved
+    transitions:
+    - to: Send
+      title: Schvaleno
+      when: $.actions.applyApproval.output.approved
+    - to: Done
+      title: Zamitnuto
+      when: $.actions.applyApproval.output.approved == false
+  Send:
+    title: Send & CRM
+    onEntry:
+      kind: sequence
+      actions:
+      - as: sendPartner
+        kind: builtin
+        name: pointee.email.call
+        args:
+          from: '"nabidky@example.com"'
+          to: $.data.emailFrom
+          subject: $.data.emailSubject
+          htmlBody: '"<p>Dobry den, v priloze zasilame nabidku. S pozdravem.</p>"'
+      - as: writeCrm
+        kind: builtin
+        name: pointee.api.call
+        args:
+          url: '"https://REPLACE-CRM-ENDPOINT/api/quotes"'
+          method: '"POST"'
+          headers: '{"Content-Type": "application/json", "Authorization": "Bearer REPLACE_CRM_TOKEN"}'
+          expectedStatusCodes: '[200, 201]'
+          bodyType: '"json"'
+          body: $.data.nabidkaPayload
+        outputs:
+          type: object
+          properties:
+            body:
+              type: object
+      - as: buildRecord
+        kind: builtin
+        name: pointee.code.run
+        args:
+          code: |
+            function execute({ payload, seq, partnerEmail, division }) {
+              var p = payload || {};
+              var createdAt = new Date().toISOString();
+              var header = {
+                id: 'nab-' + (p.cislo_nabidky || seq),
+                seq: seq || null,
+                cislo_nabidky: p.cislo_nabidky || null,
+                partner: partnerEmail || null,
+                division: division || null,
+                created_at: createdAt
+              };
+              var lines = [];
+              (p.polozky || []).forEach(function (it, i) {
+                lines.push({
+                  id: header.id + '-r' + (i + 1),
+                  nabidka_id: header.id,
+                  poradi: i + 1,
+                  kod_produktu: it.kod_produktu,
+                  popis: it.popis,
+                  pocet: it.pocet,
+                  cenikova_cena_ks: it.cenikova_cena_ks,
+                  sleva: it.sleva,
+                  partner_cena_celkem: it.partner_cena_celkem,
+                  mena: it.mena,
+                  created_at: createdAt
+                });
+              });
+              return { headerRows: [header], lineRows: lines };
+            }
+          inputs: '{ payload: $.data.nabidkaPayload, seq: $.data.nabidkaSeq, partnerEmail: $.data.emailFrom, division: $.data.division }'
+        outputs:
+          type: object
+          properties:
+            headerRows:
+              type: array
+            lineRows:
+              type: array
+      - as: saveHeader
+        kind: builtin
+        name: pointee.dataset.write
+        args:
+          datasetId: '"REPLACE_DATASET_ID_NABIDKY"'
+          tableName: '"nabidky"'
+          rows: $.actions.buildRecord.output.headerRows
+          replace: false
+      - as: saveLines
+        kind: builtin
+        name: pointee.dataset.write
+        args:
+          datasetId: '"REPLACE_DATASET_ID_NABIDKY"'
+          tableName: '"nabidky_polozky"'
+          rows: $.actions.buildRecord.output.lineRows
+          replace: false
+      - kind: mutate
+        set:
+          status: '"sent"'
+          invoiceId: $.actions.buildRecord.output.headerRows
+    transitions:
+    - to: Done
+      when: $.actions.saveHeader.completed
+  Failed:
+    title: Failed
+    onEntry:
+      kind: sequence
+      actions:
+      - kind: mutate
+        set:
+          status: '"failed"'
+      - as: notifyFailed
+        kind: builtin
+        name: pointee.email.call
+        args:
+          from: '"nabidky@example.com"'
+          to: '"ops@example.com"'
+          subject: '"Zpracovani nabidky selhalo"'
+          htmlBody: '"<p>Zpracovani nabidky selhalo. Zkontrolujte case.</p>"'
+  Done:
+    title: Done
+    onEntry:
+      kind: mutate
+      set:
+        status: $.data.status
+        cisloNabidky: $.data.cisloNabidky
+        failReason: $.data.failReason
+intake:
+  attachments:
+  - key: emailRaw
+    name: emailRaw
+    required: false
+    multiple: false
+  formDisplayMode: List
